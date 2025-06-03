@@ -1,0 +1,10 @@
+C:\Users\dinod\AppData\Roaming\Python\Python310\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+Traceback (most recent call last):
+  File "C:\Users\dinod\Desktop\crypto-bot\main.py", line 5, in <module>
+    bot.run()
+  File "C:\Users\dinod\Desktop\crypto-bot\trader.py", line 64, in run
+    print(f"\U0001f4c8 Τιμή: {price:.2f} | Πρόβλεψη: {prob_up:.2f} | Ενέργεια: {action}")
+  File "C:\Program Files\Python310\lib\encodings\cp1253.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f4c8' in position 0: character maps to <undefined>

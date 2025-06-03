@@ -1,0 +1,1045 @@
+
+. .env
+--------------------------------------------------
+BINANCE_API_KEY=C4E4MNf6m6UrFOLFHt5DvrQ1s9Jssc5yiYL4xGicCEXfRNk0UIFU3mKuNAPMEoiD
+BINANCE_API_SECRET=fbbjKUkGAEvDjByFLtEIQBf5ayk0m9nZInDAncUO1cIfaeTbZ1uvvZQirb9VCqbD
+
+. all_code.txt
+--------------------------------------------------
+
+
+. analyze_performance.py
+--------------------------------------------------
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def analyze():
+    log_file = "bot_run_log.csv"
+    trade_file = "trade_log.csv"
+
+    try:
+        log_df = pd.read_csv(
+            log_file,
+            header=None,
+            names=[
+                "timestamp",
+                "prediction",
+                "action",
+                "price",
+                "balance_usdt",
+                "balance_asset",
+            ],
+        )
+    except FileNotFoundError:
+        print("⛔ Δεν βρέθηκε το αρχείο bot_run_log.csv")
+        return
+
+    try:
+        trade_df = pd.read_csv(trade_file)
+    except FileNotFoundError:
+        trade_df = pd.DataFrame(
+            columns=[
+                "timestamp",
+                "action",
+                "price",
+                "amount",
+                "balance_usdt",
+                "balance_asset",
+            ]
+        )
+
+    total_runs = len(log_df)
+    buys = log_df["action"].value_counts().get("BUY", 0)
+    sells = log_df["action"].value_counts().get("SELL", 0)
+    stop_loss = log_df["action"].value_counts().get("STOP LOSS SELL", 0)
+    take_profit = log_df["action"].value_counts().get("TAKE PROFIT SELL", 0)
+
+    start_usdt = 1000
+    final_usdt = float(log_df.iloc[-1]["balance_usdt"])
+    final_btc = float(log_df.iloc[-1]["balance_asset"])
+    final_price = float(log_df.iloc[-1]["price"])
+    total_value = final_usdt + (final_btc * final_price)
+
+    roi = ((total_value - start_usdt) / start_usdt) * 100
+
+    # KPIs από trade_log
+    num_trades = len(trade_df) // 2  # υποθέτουμε buy/sell ζεύγη
+    trade_returns = []
+    wins = 0
+
+    for i in range(0, len(trade_df) - 1, 2):
+        buy = trade_df.iloc[i]
+        sell = trade_df.iloc[i + 1]
+        if buy["action"] == "BUY" and sell["action"] in [
+            "SELL",
+            "STOP LOSS SELL",
+            "TAKE PROFIT SELL",
+        ]:
+            ret = (sell["price"] - buy["price"]) / buy["price"]
+            trade_returns.append(ret)
+            if ret > 0:
+                wins += 1
+
+    avg_return = (sum(trade_returns) / len(trade_returns)) * 100 if trade_returns else 0
+    win_rate = (wins / len(trade_returns)) * 100 if trade_returns else 0
+
+    print("📊 ΑΞΙΟΛΟΓΗΣΗ BOT")
+    print(f"   - Συνολικά runs: {total_runs}")
+    print(f"   - Αγορές: {buys} | Πωλήσεις: {sells}")
+    print(f"   - Take Profit: {take_profit} | Stop Loss: {stop_loss}")
+    print(f"   - Τελική αξία χαρτοφυλακίου: {total_value:.2f} USDT")
+    print(f"   - ROI: {roi:.2f}%")
+    print(f"   - Μέση απόδοση ανα trade: {avg_return:.2f}%")
+    print(f"   - Ποσοστό επιτυχημένων trades: {win_rate:.2f}%")
+    print("")
+
+    # Οπτική αναπαράσταση
+    log_df = log_df[log_df["timestamp"] != "timestamp"]
+    log_df["timestamp"] = pd.to_datetime(log_df["timestamp"], errors="coerce")
+    log_df["balance_usdt"] = pd.to_numeric(log_df["balance_usdt"], errors="coerce")
+    log_df["balance_asset"] = pd.to_numeric(log_df["balance_asset"], errors="coerce")
+    log_df["price"] = pd.to_numeric(log_df["price"], errors="coerce")
+
+    log_df.set_index("timestamp", inplace=True)
+    log_df["portfolio_value"] = log_df["balance_usdt"] + (
+        log_df["balance_asset"] * log_df["price"]
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(log_df.index, log_df["portfolio_value"], label="Portfolio Value")
+    plt.title(" Portfolio Value Over Time")
+    plt.xlabel("Time")
+    plt.ylabel("USDT")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    analyze()
+
+
+. backtest.py
+--------------------------------------------------
+from features import extract_features, FEATURE_NAMES
+import config
+import pandas as pd
+import joblib
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD
+from ta.volatility import BollingerBands
+from data_fetcher import get_klines
+import csv
+
+
+def run_backtest(
+    lookback="30 day ago UTC", model_path="model.pkl", scaler_path="scaler.pkl"
+):
+    fee_rate = 0.001  # 0.1%
+
+    print(
+        "[backtest.py] Starting backtest with thresholds:",
+        f"BUY={config.BUY_THRESHOLD}, SELL={config.SELL_THRESHOLD}",
+    )
+
+    df = get_klines(lookback=lookback)
+    print("Rows fetched from get_klines():", len(df))
+    df = extract_features(df)
+    X = df[FEATURE_NAMES]
+
+    scaler = joblib.load(scaler_path)
+    X_scaled = scaler.transform(X)
+    model = joblib.load(model_path)
+
+    usdt = 1000
+    btc = 0
+    last_buy_price = None
+    trades = 0
+
+    log_fields = ["timestamp", "action", "price", "usdt", "btc"]
+    with open("backtest_log.csv", mode="w", newline="") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=log_fields)
+        writer.writeheader()
+
+        for i in range(len(X_scaled)):
+            price = df["close"].values[i]
+            timestamp = df.index[i]
+            prob_up = model.predict_proba([X_scaled[i]])[0][1]
+
+            def log_trade(action):
+                writer.writerow(
+                    {
+                        "timestamp": timestamp,
+                        "action": action,
+                        "price": price,
+                        "usdt": usdt,
+                        "btc": btc,
+                    }
+                )
+
+            if btc > 0 and last_buy_price:
+                change = (price - last_buy_price) / last_buy_price
+                if change <= -config.STOP_LOSS_PCT:
+                    usdt += btc * price
+                    btc = 0
+                    trades += 1
+                    log_trade("STOP_LOSS")
+                    continue
+                elif change >= config.TAKE_PROFIT_PCT:
+                    usdt += btc * price
+                    btc = 0
+                    trades += 1
+                    log_trade("TAKE_PROFIT")
+                    continue
+
+            if prob_up > config.BUY_THRESHOLD and usdt > 10:
+                btc = (usdt / price) * (1 - fee_rate)
+                usdt = 0
+                last_buy_price = price
+                trades += 1
+                log_trade("BUY")
+            elif prob_up < config.SELL_THRESHOLD and btc > 0:
+                usdt = (btc * price) * (1 - fee_rate)
+                btc = 0
+                trades += 1
+                log_trade("SELL")
+
+    final_price = df["close"].values[-1]
+    total_value = usdt + btc * final_price
+    roi = ((total_value - 1000) / 1000) * 100
+
+    print("Αποτελέσματα Backtest:")
+    print(f"   - Τελική αξία χαρτοφυλακίου: {total_value:.2f} USDT")
+    print(f"   - Κέρδος/Ζημιά: {total_value - 1000:.2f} USDT")
+    print(f"   - ROI: {roi:.2f}%")
+    print(f"   - Πλήθος trades: {trades}")
+    print("Backtest ολοκληρώθηκε.")
+
+
+if __name__ == "__main__":
+    run_backtest()
+
+
+. config.py
+--------------------------------------------------
+INTERVAL_SECONDS = 3600  # 1 ωρα
+LIVE_MODE = False  # Εδώ βάζεις True για live trading
+
+# Thresholds για προβλέψεις
+BUY_THRESHOLD = 0.6
+SELL_THRESHOLD = 0.15
+STOP_LOSS_PCT = 0.03  # 3% κάτω από την τιμή αγοράς
+TAKE_PROFIT_PCT = 0.05  # 5% πάνω από την τιμή αγοράς
+
+print("[config.py] Loaded configuration.")
+
+
+. dashboard.py
+--------------------------------------------------
+from flask import Flask, render_template_string
+import pandas as pd
+import matplotlib.pyplot as plt
+import io
+import base64
+import tailer
+from io import StringIO
+import matplotlib.pyplot as plt
+import io
+import base64
+
+app = Flask(__name__)
+
+TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+    <title>Crypto Bot Dashboard</title>
+    <meta http-equiv="refresh" content="10">
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f4f4f4; }
+        .box { background: white; padding: 20px; border-radius: 10px; max-width: 800px; }
+        h1 { color: #333; }
+        .stat { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+<div class="box">
+    <h1>📊 Crypto Bot Dashboard</h1>
+    <div class="stat"><strong>Τιμή BTC/USDT:</strong> {{ price }}</div>
+    <div class="stat"><strong>Υπόλοιπο USDT:</strong> {{ usdt }}</div>
+    <div class="stat"><strong>Υπόλοιπο BTC:</strong> {{ btc }}</div>
+    <div class="stat"><strong>Συνολική Αξία:</strong> {{ value }} USDT</div>
+    <div class="stat"><strong>Τελευταία πρόβλεψη:</strong> {{ prediction }}</div>
+    <div class="stat"><strong>Πλήθος trades:</strong> {{ trades }}</div>
+    <h2>📈 Εξέλιξη Χαρτοφυλακίου</h2>
+    <img src="data:image/png;base64,{{ chart }}">
+</div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def dashboard():
+    try:
+        # Προσπάθησε να διαβάσεις τις τελευταίες 200 γραμμές
+        with open("bot_run_log.csv", "r", encoding="utf-8") as f:
+            lines = tailer.tail(f, 200)
+
+        # Μετατροπή σε πίνακα pandas
+        csv_data = StringIO("\n".join(lines))
+        df = pd.read_csv(csv_data, header=0, on_bad_lines='skip')
+
+    except Exception as e:
+        # Αν κάτι πάει στραβά (π.χ. αρχείο δεν υπάρχει ή είναι χαλασμένο)
+        df = pd.DataFrame(
+            columns=["timestamp", "prediction", "action", "price", "usdt_balance", "btc_balance"]
+        )
+
+    # Αν το αρχείο ήταν άδειο ή με πρόβλημα
+    if df.empty:
+        usdt = btc = price = value = 0
+        prediction = "N/A"
+    else:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+
+        df["total_value"] = df["usdt_balance"] + df["btc_balance"] * df["price"]
+
+        last = df.iloc[-1]
+        usdt = round(last["usdt_balance"], 2)
+        btc = round(last["btc_balance"], 6)
+        price = round(last["price"], 2)
+        value = round(last["total_value"], 2)
+        prediction = f"{last['prediction']:.2f} ({'BUY' if last['prediction'] > 0.6 else 'SELL' if last['prediction'] < 0.4 else 'HOLD'})"
+
+    # Διάβασε το πλήθος trades
+    try:
+        trades = len(pd.read_csv("trade_log.csv"))
+    except:
+        trades = 0
+
+    # Δημιουργία γραφήματος
+    plt.figure(figsize=(12, 6))
+    if not df.empty:
+        plt.plot(df["timestamp"], df["usdt_balance"] + df["btc_balance"] * df["price"], label="Total Value")
+    plt.title("Portfolio Evolution")
+    plt.xlabel("Time")
+    plt.ylabel("USDT")
+    plt.legend()
+    plt.grid(True)
+
+    # Μετατροπή σε εικόνα
+    img = io.BytesIO()
+    plt.savefig(img, format="png")
+    img.seek(0)
+    chart = base64.b64encode(img.read()).decode("utf-8")
+    plt.close()
+
+    return render_template_string(
+        TEMPLATE,
+        price=price,
+        usdt=usdt,
+        btc=btc,
+        value=value,
+        prediction=prediction,
+        trades=trades,
+        chart=chart,
+    )
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
+
+. data_fetcher.py
+--------------------------------------------------
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+import os
+from dotenv import load_dotenv
+import pandas as pd
+import sys
+from binance.client import Client
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+load_dotenv()
+
+api_key = os.getenv("BINANCE_API_KEY")
+api_secret = os.getenv("BINANCE_API_SECRET")
+
+if not api_key or not api_secret:
+    print("Error: Missing Binance API Key or Secret.")
+    sys.exit(1)
+
+try:
+    client = Client(api_key, api_secret)
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(2))
+    def get_klines_safe(symbol, interval, limit=100):
+        return client.get_klines(symbol=symbol, interval=interval, limit=limit)
+except BinanceAPIException as e:
+    print(f"Error initializing Binance client: {e}")
+    sys.exit(1)
+
+VALID_INTERVALS = [
+    Client.KLINE_INTERVAL_1MINUTE,
+    Client.KLINE_INTERVAL_5MINUTE,
+    Client.KLINE_INTERVAL_15MINUTE,
+    Client.KLINE_INTERVAL_30MINUTE,
+    Client.KLINE_INTERVAL_1HOUR,
+    Client.KLINE_INTERVAL_4HOUR,
+    Client.KLINE_INTERVAL_1DAY,
+]
+
+
+def get_klines(
+    symbol="BTCUSDT", interval=Client.KLINE_INTERVAL_1HOUR, lookback="7 day ago UTC"
+):
+    if interval not in VALID_INTERVALS:
+        raise ValueError(
+            f"Invalid interval: {interval}. Must be one of: {VALID_INTERVALS}"
+        )
+
+    try:
+       klines = get_klines_safe("BTCUSDT", Client.KLINE_INTERVAL_1MINUTE, limit=100)
+    except BinanceAPIException as e:
+        print(f"Binance API error while fetching klines: {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        klines,
+        columns=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_asset_volume",
+            "num_trades",
+            "taker_buy_base",
+            "taker_buy_quote",
+            "ignore",
+        ],
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+
+    numeric_columns = ["open", "high", "low", "close", "volume"]
+    df[numeric_columns] = df[numeric_columns].astype(float)
+    return df[numeric_columns]
+
+
+if __name__ == "__main__":
+    try:
+        interval = Client.KLINE_INTERVAL_5MINUTE  # Αλλαξέ το ανάλογα
+        df = get_klines(symbol="BTCUSDT", interval=interval)
+        print(df.tail())
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+
+
+. evaluate_model.py
+--------------------------------------------------
+from features import extract_features, FEATURE_NAMES
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report
+import joblib
+
+# Φόρτωση και προετοιμασία δεδομένων
+df = pd.read_csv("historical_data.csv")
+df = extract_features(df)
+
+X = df[FEATURE_NAMES].iloc[:-1]
+y = np.where(df["close"].shift(-1) > df["close"], 1, 0)[:-1]
+
+# Διαχωρισμός σε εκπαίδευση και τεστ
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+# Κανονικοποίηση
+scaler = joblib.load("scaler.pkl")
+X_test_scaled = scaler.transform(X_test)
+
+# Φόρτωση μοντέλου
+model = joblib.load("model.pkl")
+
+# Πρόβλεψη
+y_pred = model.predict(X_test_scaled)
+
+# Αξιολόγηση
+print("🔍 Accuracy:", round(accuracy_score(y_test, y_pred), 4))
+print("🎯 Precision:", round(precision_score(y_test, y_pred), 4))
+print("📢 Recall:", round(recall_score(y_test, y_pred), 4))
+print("\n📊 Αναλυτικό report:\n", classification_report(y_test, y_pred, digits=4))
+
+
+. export_all_code.py
+--------------------------------------------------
+import os
+
+# 👉 ΕΔΩ βάλε το path του φακέλου του bot
+base_path = r"C:\Users\dinod\Desktop\ΒΟΤ\crypto-bot"
+
+output_file = os.path.join(base_path, "all_code.txt")
+
+with open(output_file, "w", encoding="utf-8") as out:
+    for root, dirs, files in os.walk(base_path):
+        for file in files:
+            if file.endswith((".py", ".js", ".ts", ".json", ".txt", ".env")):
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, base_path)
+                out.write(f"\n. {rel_path}\n")
+                out.write("-" * 50 + "\n")
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    out.write(f.read() + "\n")
+
+
+. export_data.py
+--------------------------------------------------
+import pandas as pd
+from data_fetcher import get_klines
+
+from binance.client import Client  # πρόσθεσε αν δεν υπάρχει ήδη
+
+df = get_klines(
+    symbol="BTCUSDT", interval=Client.KLINE_INTERVAL_1HOUR, lookback="180 day ago UTC"
+)
+
+
+if df is None or df.empty:
+    print("⚠ Δεν ελήφθησαν δεδομένα.")
+else:
+    df.to_csv("historical_data.csv", index=False)
+    print("✅ Αποθηκεύτηκε το αρχείο historical_data.csv")
+
+
+. features.py
+--------------------------------------------------
+import pandas as pd
+import numpy as np
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volume import MFIIndicator
+from ta.trend import ADXIndicator
+
+FEATURE_NAMES = [
+    "price_change",
+    "bb_bbm",
+    "bb_bbh",
+    "rsi",
+    "stoch",
+    "macd",
+    "ema_10",
+    "atr",
+    "obv",    
+    "mfi",
+    "adx",
+
+]
+
+
+def calculate_obv(df):
+    obv = np.where(
+        df["close"] > df["close"].shift(1),
+        df["volume"],
+        np.where(df["close"] < df["close"].shift(1), -df["volume"], 0),
+    )
+    df["obv"] = obv.cumsum()
+    return df
+
+
+def extract_features(df):
+    df["mfi"] = MFIIndicator(
+        high=df["high"], low=df["low"], close=df["close"], volume=df["volume"]
+    ).money_flow_index()
+
+    df["adx"] = ADXIndicator(
+        high=df["high"], low=df["low"], close=df["close"]
+    ).adx()
+
+    df["price_change"] = df["close"].pct_change()
+
+    bb = BollingerBands(close=df["close"])
+    df["bb_bbm"] = bb.bollinger_mavg()
+    df["bb_bbh"] = bb.bollinger_hband()
+
+    df["rsi"] = RSIIndicator(close=df["close"]).rsi()
+    df["stoch"] = StochasticOscillator(
+        close=df["close"], high=df["high"], low=df["low"]
+    ).stoch()
+    df["macd"] = MACD(close=df["close"]).macd()
+    df["ema_10"] = EMAIndicator(close=df["close"], window=10).ema_indicator()
+    df["atr"] = AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"]
+    ).average_true_range()
+
+    df = calculate_obv(df)
+
+    df = df.dropna()
+    return df
+
+
+. main.py
+--------------------------------------------------
+from trader import Trader
+import schedule
+import time
+import config
+
+
+def run_bot():
+    if config.LIVE_MODE:
+        confirm = (
+            input("⚠️ Το bot είναι σε LIVE MODE. Θες να συνεχίσει; (yes/όχι): ")
+            .strip()
+            .lower()
+        )
+        if confirm not in ["yes", "y", "ναι"]:
+            print("⛔ Εκτέλεση ακυρώθηκε.")
+            return
+
+    bot = Trader()
+    bot.run_once()  # υποθέτουμε ότι δεν έχει εσωτερικό loop
+
+
+# Υπολογίζουμε λεπτά από INTERVAL_SECONDS
+interval_minutes = config.INTERVAL_SECONDS // 60
+print(f"📆 Το bot είναι ενεργό και θα τρέχει κάθε {interval_minutes} λεπτά.\n")
+
+# Προγραμματισμός με βάση το INTERVAL_SECONDS
+schedule.every(interval_minutes).minutes.do(run_bot)
+
+# Εκτελείται μία φορά άμεσα
+run_bot()
+
+# Loop scheduler
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+
+
+. optimize_thresholds.py
+--------------------------------------------------
+import subprocess
+import re
+import pandas as pd
+import shutil
+import os
+
+# Αποθηκεύουμε το αρχικό config.py
+shutil.copyfile("config.py", "config_backup.py")
+
+buy_values = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+sell_values = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+results = []
+
+try:
+    for buy in buy_values:
+        for sell in sell_values:
+            if sell >= buy:
+                continue
+
+            # Τροποποιούμε το config.py
+            with open("config.py", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            with open("config.py", "w", encoding="utf-8") as f:
+                for line in lines:
+                    if line.strip().startswith("BUY_THRESHOLD"):
+                        f.write(f"BUY_THRESHOLD = {buy}\n")
+                    elif line.strip().startswith("SELL_THRESHOLD"):
+                        f.write(f"SELL_THRESHOLD = {sell}\n")
+                    else:
+                        f.write(line)
+
+            print(f"🔍 Testing BUY={buy}, SELL={sell}...")
+
+            # Τρέχουμε το backtest.py
+            process = subprocess.Popen(
+                ["python", "backtest.py"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            output, _ = process.communicate()
+
+            try:
+                final_value = float(
+                    re.search(r"Τελική αξία χαρτοφυλακίου:\s+([0-9.]+)", output).group(1)
+                )
+                profit = float(
+                    re.search(r"Κέρδος/Ζημιά:\s+([0-9.]+)", output).group(1)
+                )
+                roi = float(
+                    re.search(r"ROI:\s+([0-9.]+)", output).group(1)
+                )
+                trades = int(
+                    re.search(r"Πλήθος trades:\s+([0-9]+)", output).group(1)
+                )
+            except Exception as e:
+                print("❌ Σφάλμα στην ανάλυση αποτελεσμάτων:", e)
+                continue
+
+            print(f"✅ ROI={roi:.2f}%, Trades={trades}")
+
+            results.append({
+                "BUY": buy,
+                "SELL": sell,
+                "Final Value": final_value,
+                "Profit": profit,
+                "ROI": roi,
+                "Trades": trades,
+            })
+
+    # Επιλογή του καλύτερου συνδυασμού
+    df = pd.DataFrame(results)
+    df.to_csv("threshold_results.csv", index=False)
+    best_row = df.loc[df["ROI"].idxmax()]
+
+    # Γράφουμε τις καλύτερες ρυθμίσεις στο config.py
+    with open("config_backup.py", "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    with open("config.py", "w", encoding="utf-8") as f:
+        for line in lines:
+            if line.strip().startswith("BUY_THRESHOLD"):
+                f.write(f"BUY_THRESHOLD = {best_row['BUY']}\n")
+            elif line.strip().startswith("SELL_THRESHOLD"):
+                f.write(f"SELL_THRESHOLD = {best_row['SELL']}\n")
+            else:
+                f.write(line)
+
+    print("\n🏁 Βέλτιστες Ρυθμίσεις:")
+    print(f"   BUY_THRESHOLD = {best_row['BUY']}")
+    print(f"   SELL_THRESHOLD = {best_row['SELL']}")
+    print(f"   ROI = {best_row['ROI']:.2f}%")
+    print("🎉 Το config.py ενημερώθηκε με τις καλύτερες τιμές.")
+
+finally:
+    # Σβήνουμε το προσωρινό backup
+    if os.path.exists("config_backup.py"):
+        os.remove("config_backup.py")
+
+
+. plot_performance.py
+--------------------------------------------------
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+
+def plot(save_to_file=False):
+    try:
+        df = pd.read_csv(
+            "bot_run_log.csv",
+            header=None,
+            names=[
+                "timestamp",
+                "prediction",
+                "action",
+                "price",
+                "balance_usdt",
+                "balance_asset",
+            ],
+        )
+    except FileNotFoundError:
+        print("⛔ Δεν βρέθηκε το αρχείο bot_run_log.csv")
+        return
+
+    df = df[
+        df["timestamp"] != "timestamp"
+    ]  # Αφαίρεσε γραμμές όπου 'timestamp' είναι η ίδια η λέξη
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])  # Πετάμε γραμμές με λάθος ημερομηνία
+    df["balance_asset"] = pd.to_numeric(df["balance_asset"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["balance_asset", "price"])
+    df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
+
+    df["asset_value"] = df["balance_asset"] * df["price"]
+    df["balance_usdt"] = pd.to_numeric(df["balance_usdt"], errors="coerce")
+
+    df["total_value"] = df["balance_usdt"] + df["asset_value"]
+
+    start_date = df["timestamp"].min().strftime("%Y-%m-%d")
+    end_date = df["timestamp"].max().strftime("%Y-%m-%d")
+    plot_title = f" Bot Portfolio από {start_date} έως {end_date}"
+
+    buy_df = df[df["action"] == "BUY"]
+    sell_df = df[df["action"] == "SELL"]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(df["timestamp"], df["total_value"], label="Συνολική Αξία", linewidth=2)
+    plt.plot(df["timestamp"], df["balance_usdt"], label="USDT", linestyle="--")
+    plt.plot(df["timestamp"], df["asset_value"], label="BTC (σε USDT)", linestyle="--")
+
+    plt.scatter(
+        buy_df["timestamp"],
+        buy_df["total_value"],
+        color="green",
+        label="BUY",
+        marker="^",
+        zorder=5,
+    )
+    plt.scatter(
+        sell_df["timestamp"],
+        sell_df["total_value"],
+        color="red",
+        label="SELL",
+        marker="v",
+        zorder=5,
+    )
+
+    def add_prediction_zone(df, condition, color, label):
+        in_zone = False
+        start = None
+        for i in range(len(df)):
+            if condition(df.iloc[i]):
+                if not in_zone:
+                    start = df.iloc[i]["timestamp"]
+                    in_zone = True
+            else:
+                if in_zone:
+                    end = df.iloc[i]["timestamp"]
+                    plt.axvspan(
+                        start,
+                        end,
+                        color=color,
+                        alpha=0.1,
+                        label=label if start == df.iloc[0]["timestamp"] else "",
+                    )
+                    in_zone = False
+        if in_zone:
+            end = df.iloc[-1]["timestamp"]
+            plt.axvspan(
+                start,
+                end,
+                color=color,
+                alpha=0.1,
+                label=label if start == df.iloc[0]["timestamp"] else "",
+            )
+
+    add_prediction_zone(df, lambda row: row["prediction"] >= 0.7, "green", "LONG ZONE")
+    add_prediction_zone(df, lambda row: row["prediction"] <= 0.3, "red", "SHORT ZONE")
+
+    plt.title(plot_title)
+    plt.xlabel("Χρόνος")
+    plt.ylabel("Αξία σε USDT")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    if save_to_file:
+        filename = f"bot_portfolio_{start_date}_to_{end_date}.png"
+        plt.savefig(filename)
+        print(f" Το γράφημα αποθηκεύτηκε ως {filename}")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    plot(save_to_file=True)
+
+
+. requirements.txt
+--------------------------------------------------
+python-binance==1.0.17       # critical: Binance API wrapper for trading and market data
+pandas==2.2.2                # critical: Data analysis and manipulation tool
+numpy==1.26.4                # critical: Fundamental package for numerical computations
+scikit-learn==1.4.2          # critical: Machine learning library for predictive data analysis
+joblib==1.4.2                # For model persistence and parallel computing
+python-dotenv==1.0.1         # For loading environment variables from .env files
+lightgbm==4.1.0
+
+
+
+. trader.py
+--------------------------------------------------
+import os
+import csv
+import time
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from config import LIVE_MODE, BUY_THRESHOLD, SELL_THRESHOLD
+from data_fetcher import get_klines
+from features import extract_features, FEATURE_NAMES
+import joblib
+from sklearn.model_selection import cross_val_score
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+class Trader:
+    def __init__(self):
+        self.model = joblib.load("model.pkl")
+        self.scaler = joblib.load("scaler.pkl")
+        self.usdt_balance = 1000
+        self.btc_balance = 0
+        self.feature_names = FEATURE_NAMES
+        self.last_buy_price = None
+        self.last_atr = None
+
+    def log_trade(self, prob_up, action, price):
+        log_exists = os.path.isfile("bot_run_log.csv")
+        with open("bot_run_log.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+            if not log_exists:
+                writer.writerow(
+                    ["timestamp", "prediction", "action", "price", "usdt_balance", "btc_balance"]
+                )
+            writer.writerow(
+                [
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    round(prob_up, 4),
+                    action,
+                    price,
+                    round(self.usdt_balance, 2),
+                    round(self.btc_balance, 6),
+                ]
+            )
+
+    def log_to_trade_log(self, action, price):
+        log_exists = os.path.isfile("trade_log.csv")
+        with open("trade_log.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+            if not log_exists:
+                writer.writerow(["timestamp", "action", "price", "amount", "balance_usdt", "balance_asset"])
+            writer.writerow([
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                action,
+                round(price, 2),
+                round(self.btc_balance if action == "BUY" else self.btc_balance, 6),
+                round(self.usdt_balance, 2),
+                round(self.btc_balance, 6)
+            ])
+
+    def run_once(self):
+        df = get_klines()
+        if df is None or df.empty:
+            print("⚠️ Τα δεδομένα από get_klines είναι άδεια.")
+            return
+
+        df = extract_features(df)
+        if df.empty:
+            print("⚠️ Δεν υπάρχουν επαρκή δεδομένα μετά την εξαγωγή χαρακτηριστικών.")
+            return
+
+        features = df[self.feature_names]
+        features_scaled = self.scaler.transform(features)
+        features_scaled_df = pd.DataFrame(features_scaled, columns=self.feature_names)
+        try:
+            prob_up = self.model.predict_proba(features_scaled_df)[-1][1]
+        except Exception as e:
+            print("❌ Σφάλμα κατά την πρόβλεψη από το μοντέλο:", e)
+            return
+
+        price = df["close"].iloc[-1]
+        current_atr = df["atr"].iloc[-1]
+        action = "HOLD"
+
+        # BUY
+        if prob_up > BUY_THRESHOLD and self.usdt_balance > 10:
+            action = "BUY"
+            if LIVE_MODE:
+                print("🔴 Live αγορά BTC")
+            else:
+                print("🟢 Paper αγορά BTC")
+                self.btc_balance = self.usdt_balance / price
+                self.usdt_balance = 0
+                self.last_buy_price = price
+                self.last_atr = current_atr
+
+        # SELL με βάση πρόβλεψη, take profit ή stop loss
+        elif self.btc_balance > 0:
+            take_profit_price = self.last_buy_price + (2 * self.last_atr)
+            stop_loss_price = self.last_buy_price - (1.5 * self.last_atr)
+
+            if price >= take_profit_price:
+                action = "SELL"
+                print("💰 Take Profit Triggered")
+
+            elif price <= stop_loss_price:
+                action = "SELL"
+                print("🔻 Stop Loss Triggered")
+
+            elif prob_up < SELL_THRESHOLD:
+                action = "SELL"
+                print("📉 Πώληση λόγω πρόβλεψης")
+
+            if action == "SELL":
+                if LIVE_MODE:
+                    print("🔴 Live πώληση BTC")
+                else:
+                    print("🟢 Paper πώληση BTC")
+                    self.usdt_balance = self.btc_balance * price
+                    self.btc_balance = 0
+
+        self.log_trade(prob_up, action, price)
+
+        if action in ["BUY", "SELL"]:
+            self.log_to_trade_log(action, price)
+
+        print(f"📈 Τιμή: {price:.2f} | Πρόβλεψη: {prob_up:.2f} | Ενέργεια: {action}")
+
+    def evaluate_model(self, df):
+        df = extract_features(df).dropna()
+        X = df[self.feature_names].iloc[:-1]
+        y = np.where(df["close"].shift(-1) > df["close"], 1, 0)[:-1]
+        X_scaled = self.scaler.transform(X)
+        scores = cross_val_score(self.model, X_scaled, y, cv=5, scoring="accuracy")
+        print("📊 Cross-validation scores:", scores)
+        print("📈 Μέση ακρίβεια:", round(scores.mean(), 4))
+
+    def run_loop(self):
+        from config import INTERVAL_SECONDS
+        while True:
+            print("\n🔁 Εκτέλεση νέου κύκλου trading...")
+            self.run_once()
+            print(f"⏳ Αναμονή για {INTERVAL_SECONDS} δευτερόλεπτα...\n")
+            time.sleep(INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    trader = Trader()
+    # trader.run_once()
+    trader.run_loop()
+
+
+. train_model.py
+--------------------------------------------------
+import pandas as pd
+import joblib
+from lightgbm import LGBMClassifier
+from sklearn.preprocessing import StandardScaler
+from features import extract_features, FEATURE_NAMES  # ✅ σωστά import
+
+# 📥 Φόρτωση ιστορικών δεδομένων
+df = pd.read_csv("historical_data.csv")
+df = extract_features(df)  # ✅ μοναδική εξαγωγή χαρακτηριστικών
+
+# 🎯 Ορισμός χαρακτηριστικών και labels
+features = FEATURE_NAMES
+df["label"] = (df["close"].shift(-1) > df["close"]).astype(int)
+df = df.dropna()
+
+X = df[features]
+y = df["label"]
+
+# ⚖️ Κανονικοποίηση
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 🧠 Εκπαίδευση μοντέλου
+model = LGBMClassifier()
+model.fit(pd.DataFrame(X_scaled, columns=features), y)
+
+# 💾 Αποθήκευση μοντέλου και scaler
+joblib.dump(model, "model.pkl")
+joblib.dump(scaler, "scaler.pkl")
+print("✅ Μοντέλο και scaler αποθηκεύτηκαν.")
+

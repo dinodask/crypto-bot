@@ -1,0 +1,34 @@
+import os
+import glob
+from datetime import datetime
+import pandas as pd
+
+# Καταγραφή σε αρχείο με βάση την ημερομηνία
+now = datetime.now()
+date_str = now.strftime("%Y-%m-%d")
+log_file = f"run_log_{date_str}.csv"
+
+run_data = {
+    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+    "prediction": prediction,
+    "action": "BUY" if prediction == 1 and self.balance_usdt == 0 else (
+               "SELL" if prediction == 0 and self.balance_asset == 0 else (
+               "STOP LOSS" if change <= -0.03 else (
+               "TAKE PROFIT" if change >= 0.05 else "NONE"))),
+    "price": self.last_price,
+    "balance_usdt": self.balance_usdt,
+    "balance_asset": self.balance_asset
+}
+
+log_df = pd.DataFrame([run_data])
+
+if os.path.exists(log_file):
+    log_df.to_csv(log_file, mode="a", header=False, index=False)
+else:
+    log_df.to_csv(log_file, index=False)
+
+# Κρατάμε μόνο τα 10 πιο πρόσφατα log αρχεία
+log_files = sorted(glob.glob("run_log_*.csv"))
+if len(log_files) > 10:
+    for old_file in log_files[:-10]:
+        os.remove(old_file)

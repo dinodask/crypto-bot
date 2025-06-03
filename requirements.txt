@@ -1,0 +1,8 @@
+python-binance==1.0.17       # critical: Binance API wrapper for trading and market data
+pandas==2.2.2                # critical: Data analysis and manipulation tool
+numpy==1.26.4                # critical: Fundamental package for numerical computations
+scikit-learn==1.4.2          # critical: Machine learning library for predictive data analysis
+joblib==1.4.2                # For model persistence and parallel computing
+python-dotenv==1.0.1         # For loading environment variables from .env files
+lightgbm==4.1.0
+
