@@ -1,8 +1,8 @@
 
 . .env
 --------------------------------------------------
-BINANCE_API_KEY=C4E4MNf6m6UrFOLFHt5DvrQ1s9Jssc5yiYL4xGicCEXfRNk0UIFU3mKuNAPMEoiD
-BINANCE_API_SECRET=fbbjKUkGAEvDjByFLtEIQBf5ayk0m9nZInDAncUO1cIfaeTbZ1uvvZQirb9VCqbD
+BINANCE_API_KEY=
+BINANCE_API_
 
 . all_code.txt
 --------------------------------------------------
